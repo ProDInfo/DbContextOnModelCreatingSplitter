@@ -1,12 +1,13 @@
 ﻿using CommandLine;
-using System.Text;
-using System.Text.RegularExpressions;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace DbContextOnModelCreatingSplitter
 {
     public class Options
     {
-        [Option('c', "dbcontext", Required = true, HelpText = "Path the the DbContext file")]
+        [Option('c', "dbcontext", Required = true, HelpText = "Path the DbContext file")]
         public string DbContextPath { get; set; } = null!;
 
         [Option('o', "outdir", Required = false, HelpText = "Output path for the generated configuration files")]
@@ -23,15 +24,12 @@ namespace DbContextOnModelCreatingSplitter
         [Option('r', "no-replace", Default = false, Required = false, HelpText = "Don't replace OnModelCreating event code")]
         public bool NoReplacement { get; set; }
 
-        [Option('e', "embed-config", Default = false, Required = false, HelpText = "Embed EntityTypeConfiguration class into entity model file")]
-        public bool EmbedConfigClass { get; set; }
+        [Option('e', "embed-configs", Default = false, Required = false, HelpText = "Embed EntityTypeConfiguration class into entity model file")]
+        public bool EmbedConfigsClasses { get; set; }
     }
 
     class Program
     {
-        static readonly short _indentSizeSource = 4;
-        static readonly short _indentSize = 4;
-
         static void Main(string[] args)
         {
             Parser.Default.ParseArguments<Options>(args)
@@ -41,148 +39,313 @@ namespace DbContextOnModelCreatingSplitter
         private static void Run(Options options)
         {
             var dbContextFilePath = Path.GetFullPath(options.DbContextPath);
-            string dbContexFolder = Path.GetDirectoryName(dbContextFilePath) ?? throw new NullReferenceException();
+            var dbContexFolder = Path.GetDirectoryName(dbContextFilePath) ?? throw new NullReferenceException();
             var configurationsDirectoryPath = !string.IsNullOrEmpty(options.OutputDirectoryPath) ? Path.GetFullPath(options.OutputDirectoryPath) : dbContexFolder;
 
             var source = File.ReadAllText(dbContextFilePath);
+            var tree = CSharpSyntaxTree.ParseText(source);
+            SyntaxNode? root = tree.GetRoot();
 
             Directory.CreateDirectory(configurationsDirectoryPath);
 
-            var contextUsingStatements = Regex.Matches(source, @"^using\s+.*?;", RegexOptions.Multiline | RegexOptions.Singleline)
-                .Select(m => m.Value)
-                .ToList();
+            // Extraer todos los using (tanto globales como dentro de namespaces)
+            var contextUsingStatements = GetDistinctUsingDirectivesFromRoot(root);
 
-            string contextNamespace = Regex.Match(source,
-                                               @"(?<=(?:^|\s|;)namespace\s+).*?(?=(?:;|\s|\{))",
-                                               RegexOptions.Multiline | RegexOptions.Singleline).Value;
+            // Obtiene el primer namespace (tradicional o file-scoped) encontrado en el archivo
+            string? contextNamespace = GetFirstNamespace(root);
 
             var configurationNamespace = options.Namespace ?? contextNamespace;
 
             Console.WriteLine("Create configClass files:");
 
-            string modelsBackupDirPath = "";
-            if (!options.NoBackup & options.EmbedConfigClass)
+            string modelsBackupDirPath = string.Empty;
+            if (!options.NoBackup & options.EmbedConfigsClasses)
             {
-                var modelsBackupDir = $"_backup_{DateTime.Now:yyyyMMddHHmmss}";
-                modelsBackupDirPath = Path.Combine(configurationsDirectoryPath, modelsBackupDir);
-                Directory.CreateDirectory(modelsBackupDirPath);
+                modelsBackupDirPath = CretaeBackupDirectory(configurationsDirectoryPath);
             }
 
-            const string statementsInnerBlockPattern = @"(?<=modelBuilder\.Entity<(?<EntityName>.*?)>\((?<EntityParameterName>.*?)\s*=>\s*\{\r?\n).*?(?:;)(?=\r?\n\s*\}\);(?!\r?\n\s*\}\);))";
-            //const string statementsInnerBlockPattern = @"(?<=modelBuilder\.Entity<(?<EntityName>.*?)>\((?<EntityParameterName>.*?)\s*=>\s*\{\r?\n).*?(?=\r?\n\s*\}\);)";
-            //const string statementsOuterBlockPattern = @"\s*modelBuilder\.Entity<.*?>\(.*?\s*=>\s*\{.*?;?.*\}\);";
-            const string statementsOuterBlockPattern = @"\s*modelBuilder\.Entity<.*?>\(.*?\s*=>\s*\{.*?\r?\n\s*\}\);(?!\r?\n\s*\}\);)\r?\n";
+            IEnumerable<InvocationExpressionSyntax> entityCalls = GetEntityInvocationExpressions(root);
 
-            var statementsBlockMatches = Regex.Matches(source, statementsOuterBlockPattern, RegexOptions.Multiline | RegexOptions.Singleline).ToList();
-
-            foreach (var blockMatch in statementsBlockMatches)
+            Dictionary<SyntaxNode, SyntaxNode> replaceNodes = [];
+            foreach (var call in entityCalls)
             {
-                var innerBlock = Regex.Match(blockMatch.Value, statementsInnerBlockPattern, RegexOptions.Multiline | RegexOptions.Singleline);
-
-                var entityMaybeFullName = innerBlock.Groups["EntityName"].Value;
-                var entityName = entityMaybeFullName.Substring(entityMaybeFullName.LastIndexOf('.') + 1);
-                var entityParameterName = innerBlock.Groups["EntityParameterName"].Value;
-
-                var statements = innerBlock.Value;
-                var indentAtStatementsFirstLine = Regex.Match(statements, @"^\s+").Value;
+                var genericName = ((GenericNameSyntax)((MemberAccessExpressionSyntax)call.Expression).Name);
+                var entityType = genericName.TypeArgumentList.Arguments.First().ToString();
+                var entityName = entityType.Contains('.') ? entityType.Substring(entityType.LastIndexOf('.') + 1) : entityType;
+                var lambda = call.ArgumentList.Arguments.FirstOrDefault()?.Expression as SimpleLambdaExpressionSyntax;
+                var parameterName = lambda?.Parameter.Identifier.Text ?? "e";
                 string suffix = options.Suffix ?? "Configuration";
 
-                short tabs = 0;
-                if (!options.EmbedConfigClass)
-                    tabs = 1;
+                // Extraer el cuerpo del lambda correctamente
+                SyntaxList<StatementSyntax> configStatements;
 
-                var configClass = new StringBuilder();
-                configClass.AppendLine(Tab(tabs) + $"public class {entityName}{suffix} : IEntityTypeConfiguration<{entityMaybeFullName}>");
-                configClass.AppendLine(Tab(tabs) + "{");
-                tabs++;
-                configClass.AppendLine(Tab(tabs) + $"public void Configure(EntityTypeBuilder<{entityMaybeFullName}> {entityParameterName})");
-                configClass.AppendLine(Tab(tabs) + "{");
-                tabs++;
-                configClass.AppendLine(statements.Replace(indentAtStatementsFirstLine, Tab(tabs)));
-                tabs--;
-                configClass.AppendLine(Tab(tabs) + "}");
-                tabs--;
-                configClass.AppendLine(Tab(tabs) + "}");
-
-                string configurationFilePath;
-                if (options.EmbedConfigClass)
+                if (lambda?.Body is BlockSyntax block)
                 {
-                    configurationFilePath = Path.Combine(configurationsDirectoryPath, $"{entityName}.cs");
-                    var modelContents = File.ReadAllText(configurationFilePath);
+                    // Si es un bloque, usa sus sentencias internas (sin llaves)
+                    configStatements = block.Statements;
+                }
+                else if (lambda?.Body is ExpressionSyntax expr)
+                {
+                    // Si es una expresión, conviértela en una sentencia
+                    configStatements = SyntaxFactory.SingletonList<StatementSyntax>(
+                        SyntaxFactory.ExpressionStatement(expr));
+                }
+                else
+                {
+                    configStatements = new SyntaxList<StatementSyntax>();
+                }
 
-                    var usingBlockMatches = Regex.Matches(modelContents, "^using .*?;\r?\n", RegexOptions.Multiline | RegexOptions.Singleline);
-                    var lastUsingLine = usingBlockMatches.Last().Value;
-                    var modifiedUsingBlock = lastUsingLine +
-                                             "using Microsoft.EntityFrameworkCore;" + Environment.NewLine +
-                                             "using Microsoft.EntityFrameworkCore.Metadata.Builders;" + Environment.NewLine;
-                    modelContents = modelContents.Replace(lastUsingLine, modifiedUsingBlock);
-                    modelContents += Environment.NewLine + configClass.ToString();
+                var markerTrivia = SyntaxFactory.TriviaList(
+                    SyntaxFactory.Comment("//__REPLACE_CONFIG__")
+                );
 
+
+
+                string configurationFilePath = Path.Combine(configurationsDirectoryPath, $"{entityName}{suffix}.cs");
+                if (options.EmbedConfigsClasses && File.Exists(configurationFilePath))
+                {
                     if (!options.NoBackup)
                     {
                         var backupFilePath = Path.Combine(modelsBackupDirPath, Path.GetFileName(configurationFilePath));
                         File.Copy(configurationFilePath, backupFilePath, true);
                     }
 
-                    File.WriteAllText(configurationFilePath, modelContents);
+                    // Extraer todos los using (tanto globales como dentro de namespaces)
+                    SyntaxNode? modelRoot = CSharpSyntaxTree.ParseText(File.ReadAllText(configurationFilePath)).GetRoot();
+                    contextUsingStatements = GetDistinctUsingDirectivesFromRoot(modelRoot);
                 }
-                else
-                {
-                    var configFile = new StringBuilder();
-                    configFile.AppendLine(string.Join(Environment.NewLine, contextUsingStatements));
-                    configFile.AppendLine("using Microsoft.EntityFrameworkCore.Metadata.Builders;");
-                    configFile.AppendLine($"using {contextNamespace};");
-                    configFile.AppendLine();
-                    configFile.AppendLine($"namespace {configurationNamespace}");
-                    configFile.AppendLine("{");
-                    configFile.Append(configClass);
-                    configFile.AppendLine("}");
+                contextUsingStatements.Add("Microsoft.EntityFrameworkCore");
+                contextUsingStatements.Add("Microsoft.EntityFrameworkCore.Metadata.Builders");
 
-                    configurationFilePath = Path.Combine(configurationsDirectoryPath, $"{entityName}{suffix}.cs");
-                    File.WriteAllText(configurationFilePath, configFile.ToString());
-                }
+                // Crear el código (usings, namespace y la clase de configuración)
+                var className = $"{entityName}{suffix}";
+                var compilationUnit = SyntaxFactory.CompilationUnit()
+                    .AddUsings(contextUsingStatements
+                        .Select(u => SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(u)))
+                        .ToArray()
+                    )
+                    .AddMembers(SyntaxFactory.FileScopedNamespaceDeclaration(
+                        SyntaxFactory.ParseName(configurationNamespace))
+                        .AddMembers(SyntaxFactory.ClassDeclaration(className)
+                        .AddModifiers(SyntaxFactory.Token(SyntaxKind.PublicKeyword))
+                        .AddBaseListTypes(
+                            SyntaxFactory.SimpleBaseType(
+                                SyntaxFactory.ParseTypeName($"IEntityTypeConfiguration<{entityType}>")))
+                        .AddMembers(
+                                SyntaxFactory.MethodDeclaration(
+                                    SyntaxFactory.PredefinedType(SyntaxFactory.Token(SyntaxKind.VoidKeyword)),
+                                    "Configure")
+                                .AddModifiers(SyntaxFactory.Token(SyntaxKind.PublicKeyword))
+                                .AddParameterListParameters(
+                                    SyntaxFactory.Parameter(SyntaxFactory.Identifier(parameterName))
+                                        .WithType(SyntaxFactory.ParseTypeName($"EntityTypeBuilder<{entityType}>")))
+                                .WithBody(SyntaxFactory.Block(
+                                        SyntaxFactory.EmptyStatement().WithLeadingTrivia(markerTrivia))
+                                )
+                            )
+                        )
+                    )
+                    .NormalizeWhitespace();
 
-                Console.WriteLine(TabSrc(1) + configurationFilePath);
+                compilationUnit = ReplaceMarkerWithTrivia(compilationUnit, configStatements);
 
-                string srcEntityConfigLine = "";
+                // Convertir a texto
+                var code = compilationUnit.ToFullString();
+                File.WriteAllText(configurationFilePath, code);
+                Console.WriteLine($"    {configurationFilePath}");
+
+
                 if (!options.NoReplacement)
-                    srcEntityConfigLine = Environment.NewLine + TabSrc(3) + 
-                        $"new {entityName}{suffix}().Configure(modelBuilder.Entity<{entityMaybeFullName}>());";
-                        //$"modelBuilder.ApplyConfiguration(new {entityName}{suffix}());";
-                source = source.Replace(blockMatch.Value, srcEntityConfigLine);
+                {
+                    var entityInvocation = SyntaxFactory.InvocationExpression(
+                        SyntaxFactory.MemberAccessExpression(
+                            SyntaxKind.SimpleMemberAccessExpression,
+                            SyntaxFactory.IdentifierName("modelBuilder"),
+                            SyntaxFactory.GenericName("Entity")
+                                .WithTypeArgumentList(
+                                    SyntaxFactory.TypeArgumentList(
+                                        SyntaxFactory.SingletonSeparatedList<TypeSyntax>(
+                                            SyntaxFactory.ParseTypeName(entityType)
+                                        )
+                                    )
+                                )
+                        )
+                    )
+                    .WithLeadingTrivia(call.GetLeadingTrivia())
+                    .WithTrailingTrivia(call.GetTrailingTrivia());
+                    replaceNodes.Add(call, entityInvocation);
+                }
             }
 
-            if (!statementsBlockMatches.Any())
+            root = root.ReplaceNodes(
+                replaceNodes.Keys,
+                (original, _) => replaceNodes[original]
+            );
+
+            var rootCompilationUnit = root as CompilationUnitSyntax;
+            bool hasUsings = rootCompilationUnit?.Members.OfType<UsingDirectiveSyntax>().Any() == true;
+
+            string usingToAdd = configurationNamespace;
+            if (rootCompilationUnit != null)
             {
-                Console.WriteLine(TabSrc(1) + "No entity definitions found.");
+                var usingName = SyntaxFactory.ParseName(usingToAdd);
+                var usingDirective = SyntaxFactory.UsingDirective(usingName)
+                    .WithUsingKeyword(
+                        SyntaxFactory.Token(SyntaxKind.UsingKeyword)
+                            .WithTrailingTrivia(SyntaxFactory.Space)
+                    );
+                rootCompilationUnit = rootCompilationUnit.AddUsings(usingDirective);
+
+                // Añadir línea vacía entre usings y namespace
+                if (rootCompilationUnit.Members.Count > 0)
+                {
+                    var firstMember = rootCompilationUnit.Members[0];
+                    var newFirstMember = firstMember.WithLeadingTrivia(
+                        SyntaxFactory.TriviaList(
+                            SyntaxFactory.CarriageReturnLineFeed
+                        ).AddRange(firstMember.GetLeadingTrivia())
+                    );
+
+                    rootCompilationUnit = rootCompilationUnit.ReplaceNode(firstMember, newFirstMember);
+                }
+                root = rootCompilationUnit;
+            }
+
+
+
+            if (!entityCalls.Any())
+            {
+                Console.WriteLine("    No entity definitions found.");
                 return;
             }
 
             if (!options.NoBackup)
             {
-                if (options.EmbedConfigClass)
+                if (options.EmbedConfigsClasses)
                     Console.WriteLine($"Backup models files saved at: {modelsBackupDirPath}");
                 Console.WriteLine();
 
                 var backupFilePath = Path.Combine(dbContexFolder, $"{Path.GetFileName(dbContextFilePath)}.{DateTime.Now:yyyyMMddHHmmss}.bak");
                 Console.WriteLine("Backup DbContext file:");
-                Console.WriteLine(TabSrc(1) + $"Original file path: {dbContextFilePath}");
-                Console.WriteLine(TabSrc(1) + $"Backup file path: {backupFilePath}");
+                Console.WriteLine($"    Original file path: {dbContextFilePath}");
+                Console.WriteLine($"    Original file path: {backupFilePath}");
                 File.Copy(dbContextFilePath, backupFilePath, true);
             }
+
+            source = root.ToFullString();
 
             File.WriteAllText(dbContextFilePath, source);
         }
 
-        private static string TabSrc(short tabsNumber)
+        private static IEnumerable<InvocationExpressionSyntax> GetEntityInvocationExpressions(SyntaxNode root)
         {
-            return new string(' ', _indentSizeSource * tabsNumber); ;
+            var onModelCreating = root.DescendantNodes()
+                .OfType<MethodDeclarationSyntax>()
+                .First(m => m.Identifier.Text == "OnModelCreating");
+
+            var entityCalls = onModelCreating.DescendantNodes()
+                .OfType<InvocationExpressionSyntax>()
+                .Where(inv =>
+                    inv.Expression is MemberAccessExpressionSyntax memberAccess &&
+                    memberAccess.Name.Identifier.Text == "Entity" &&
+                    memberAccess.Expression is IdentifierNameSyntax idName &&
+                    idName.Identifier.Text == "modelBuilder"
+                );
+            return entityCalls;
         }
 
-        private static string Tab(short tabsNumber)
+        private static string CretaeBackupDirectory(string configurationsDirectoryPath)
         {
-            return new string(' ', _indentSize * tabsNumber); ;
+            string modelsBackupDirPath;
+            var modelsBackupDir = $"_backup_{DateTime.Now:yyyyMMddHHmmss}";
+            modelsBackupDirPath = Path.Combine(configurationsDirectoryPath, modelsBackupDir);
+            Directory.CreateDirectory(modelsBackupDirPath);
+            return modelsBackupDirPath;
         }
 
+        private static string? GetFirstNamespace(SyntaxNode root)
+        {
+            return root.DescendantNodes()
+                .Select(n =>
+                    n is NamespaceDeclarationSyntax ns ? ns.Name.ToString() :
+                    n is FileScopedNamespaceDeclarationSyntax fs ? fs.Name.ToString() :
+                    null)
+                .FirstOrDefault(n => n != null);
+        }
+
+        private static CompilationUnitSyntax ReplaceMarkerWithTrivia(CompilationUnitSyntax compilationUnit, SyntaxList<StatementSyntax> configStatements)
+        {
+            // Buscar la primera clase en el árbol
+            var classDecl = compilationUnit.DescendantNodes().OfType<ClassDeclarationSyntax>().FirstOrDefault();
+            if (classDecl is null) { return compilationUnit; }
+
+            var configure = classDecl.Members.OfType<MethodDeclarationSyntax>()
+                .FirstOrDefault(m => m.Identifier.Text == "Configure" && m.Body != null);
+            if (configure is null) { return compilationUnit; }
+
+            // Buscar el statement con el comentario marcador
+            var marker = configure.Body!.Statements
+                .FirstOrDefault(st =>
+                    st.GetLeadingTrivia().Any(tr => tr.IsKind(SyntaxKind.SingleLineCommentTrivia) && tr.ToString().Contains("__REPLACE_CONFIG__")));
+            if (marker is null) { return compilationUnit; }
+
+            // Crear el nuevo método Configure con las sentencias reales
+            var newConfigure = configure.ReplaceNode(marker, RemoveLeadingTabulationFromAllLines(configStatements, 4));
+            var newClassDecl = classDecl.ReplaceNode(configure, newConfigure);
+            return compilationUnit.ReplaceNode(classDecl, newClassDecl);
+        }
+
+        private static SyntaxList<StatementSyntax> RemoveLeadingTabulationFromAllLines(SyntaxList<StatementSyntax> statements, int spaces = 8)
+        {
+            var spaceString = new string(' ', spaces);
+
+            SyntaxTrivia ProcessTrivia(SyntaxTrivia trivia)
+            {
+                if (trivia.IsKind(SyntaxKind.WhitespaceTrivia))
+                {
+                    var lines = trivia.ToFullString().Split('\n');
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        var line = lines[i];
+                        if (line.StartsWith(spaceString))
+                            lines[i] = line.Substring(spaces);
+                        else if (line.StartsWith("\t"))
+                            lines[i] = line.Substring(1);
+                    }
+                    return SyntaxFactory.Whitespace(string.Join("\n", lines));
+                }
+                return trivia;
+            }
+
+            var newStatements = statements.Select(st =>
+            {
+                var leading = st.GetLeadingTrivia().Select(ProcessTrivia).ToSyntaxTriviaList();
+                var node = st.WithLeadingTrivia(leading);
+
+                // También procesar el interior del statement si es una expresión multilínea
+                var fullText = node.ToFullString();
+                var processedText = string.Join(
+                    "\n",
+                    fullText.Split('\n').Select(line =>
+                        line.StartsWith(spaceString) ? line.Substring(spaces) :
+                        (line.StartsWith("\t") ? line.Substring(1) : line)
+                    )
+                );
+                // Parsear de nuevo el statement para asegurar el ajuste en todas las líneas
+                var parsed = SyntaxFactory.ParseStatement(processedText);
+                return parsed.WithTriviaFrom(node);
+            });
+
+            return SyntaxFactory.List(newStatements);
+        }
+
+        private static HashSet<string> GetDistinctUsingDirectivesFromRoot(SyntaxNode root)
+        {
+            return root.DescendantNodes()
+                .OfType<UsingDirectiveSyntax>()
+                .Select(u => u.ToFullString().Trim().Replace("using ", "").Replace(";", ""))
+                .Distinct()
+                .ToHashSet();
+        }
     }
 }
