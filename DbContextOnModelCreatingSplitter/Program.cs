@@ -157,23 +157,30 @@ namespace DbContextOnModelCreatingSplitter
 
                 if (!options.NoReplacement)
                 {
-                    var entityInvocation = SyntaxFactory.InvocationExpression(
+                    // Crear: new AlmacenConfig()
+                    var objectCreation = SyntaxFactory.ObjectCreationExpression(
+                        SyntaxFactory.IdentifierName($"{entityName}{suffix}")
+                            .WithLeadingTrivia(SyntaxFactory.Space)
+                    )
+                    .WithArgumentList(SyntaxFactory.ArgumentList());
+
+                    // Crear: modelBuilder.ApplyConfiguration(new AlmacenConfig())
+                    var applyConfigInvocation = SyntaxFactory.InvocationExpression(
                         SyntaxFactory.MemberAccessExpression(
                             SyntaxKind.SimpleMemberAccessExpression,
                             SyntaxFactory.IdentifierName("modelBuilder"),
-                            SyntaxFactory.GenericName("Entity")
-                                .WithTypeArgumentList(
-                                    SyntaxFactory.TypeArgumentList(
-                                        SyntaxFactory.SingletonSeparatedList<TypeSyntax>(
-                                            SyntaxFactory.ParseTypeName(entityType)
-                                        )
-                                    )
-                                )
+                            SyntaxFactory.IdentifierName("ApplyConfiguration")
+                        ),
+                        SyntaxFactory.ArgumentList(
+                            SyntaxFactory.SingletonSeparatedList(
+                                SyntaxFactory.Argument(objectCreation)
+                            )
                         )
                     )
                     .WithLeadingTrivia(call.GetLeadingTrivia())
                     .WithTrailingTrivia(call.GetTrailingTrivia());
-                    replaceNodes.Add(call, entityInvocation);
+
+                    replaceNodes.Add(call, applyConfigInvocation);
                 }
             }
 
