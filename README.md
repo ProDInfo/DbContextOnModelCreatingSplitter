@@ -1,50 +1,59 @@
-# What's different about this fork:
-### Fixes:
- - The using statement for contextNamespace had two semicolons at the end of line.
- - The modelBuilder not capture all lambda.
-
-### News:
- - Suffix for the generated configuration files, by using the 'suffix' option at command-line ('-s').
- - Code that invokes configuration class is inserted at OnModelCreating event, but can be ignored by 'no-replace' option at command-line ('-r').
- - The configuration class can now be embedded into entity model file, by using the 'embed-config' option at command-line ('-e').
----
-
 # DbContext OnModelCreating Splitter
-Command line tool that splits FluentAPI entity definitions from `DbContext.OnModelCreating()` into separate configuration files.
+Herramienta de línea de comandos para extraer las definiciones FluentAPI dentro de DbContext.OnModelCreating() y generar archivos de configuración (IEntityTypeConfiguration) separados.
 
-This tool can be used as a workaround for https://github.com/aspnet/EntityFrameworkCore/issues/8434.
+Útil como solución temporal para: https://github.com/aspnet/EntityFrameworkCore/issues/8434
 
-### Usage
+Resumen de comportamientos clave
+- Los ficheros de configuración se generan en el subdirectorio de configuraciones (--configs-subdir).
+- Los ficheros de entities se escriben siempre en la carpeta de salida de entities (--entities-subdir).
+- Renombrado de entities (añadir sufijo con --entity-suffix):
+  - Si no se especifica --output-dir, O si la carpeta destino de entities coincide con la carpeta de entrada de entities, se renombra (y se sobrescribe) el fichero de entrada original.
+  - Si se especifica --output-dir y la carpeta de entities de salida es distinta de la de entrada, el origen se deja intacto y sólo se generan/renombran los ficheros en la salida.
+- Por defecto se crea una copia de seguridad del DbContext original salvo que se pase -B/--no-backup.
+
+Opciones y uso
 ```
-  -c, --dbcontext    Required. Path the the DbContext file
-
-  -o, --outdir       Output path for the generated configuration files
-
-  -n, --namespace    Namespace for the generated configuration classes
-
-  -s, --suffix       Suffix for the generated configuration files
-  
-  -B, --no-backup    Don't keep a copy of the original DbContext file
-  
-  -r, --no-replace   Don't replace OnModelCreating event code
- 
-  -e, --embed-config Embed EntityTypeConfiguration class into entity model file
-
-  --help             Display this help screen.
-
-  --version          Display version information.
+  -c, --context-file   (requerido) Ruta al fichero DbContext de entrada
+      --input-dir      Directorio de entrada para los ficheros entity/model (por defecto: directorio del DbContext)
+  -o, --output-dir     Directorio base de salida (si se omite, la salida se considera el directorio de contexto)
+      --context-subdir Subruta dentro de output-dir donde escribir el DbContext (por defecto: .)
+      --entities-subdir Subruta dentro de output-dir donde escribir los entities (por defecto: Entities)
+      --configs-subdir  Subruta dentro de output-dir donde escribir las configuraciones (por defecto: Configurations)
+  -n, --namespace      Namespace base que se usa para generar namespaces en subcarpetas
+  -s, --config-suffix  Sufijo para las clases de configuración (por defecto: Configuration)
+  -t, --entity-suffix  Sufijo para las clases entity (ej.: "Entity") — activa el renombrado cuando procede
+  -B, --no-backup      No guardar copia de seguridad del DbContext original
+  -r, --no-replace     No sustituir las llamadas modelBuilder.Entity(...) por ApplyConfiguration(...) en el DbContext
+  -e, --embed-configs  Insertar la clase de configuración generada dentro del fichero de entidad (embed)
+  --help               Mostrar ayuda
+  --version            Mostrar versión
 ```
 
-### Example
+Ejemplos
+1) Generar en un directorio de salida distinto (no se toca la fuente original):
 ```
-DbContextOnModelCreatingSplitter -c Data\MyContext.cs -o Data\Configurations -n MyNamespace.Data.Configurations
+DbContextOnModelCreatingSplitter -c Input\Data\MyContext.cs --input-dir Input\Entities -o Output --context-subdir Contexts --entities-subdir Entities --configs-subdir Configurations
 ```
+Resultado:
+- Se generan: Output\Contexts\MyContext.cs (DbContext actualizado), Output\Entities\... (entities generados), Output\Configurations\... (configs generados)
+- Los archivos originales en Input\Entities permanecen sin cambios.
 
-### Note
-A backup of the original DbContext file is created by default.
+2) Ejecutar sin --output-dir (salida en el mismo directorio que la entrada):
+```
+DbContextOnModelCreatingSplitter -c Input\Data\MyContext.cs --input-dir Input\Entities -t Entity -s Configuration
+```
+Resultado:
+- Se genera MyContext.cs actualizado en el mismo directorio.
+- Los ficheros de entidad en Input\Entities son renombrados si se ha especificado --entity-suffix (por ejemplo TaskBlueprint -> TaskBlueprintEntity) y su contenido actualizado.
+- Se crea backup del DbContext original salvo que se haya usado -B.
 
-### Download
-You can [download](https://github.com/ProDInfo/DbContextOnModelCreatingSplitter/releases/download/v1.0.2/DbContextOnModelCreatingSplitter.exe) the binaries from the latest [release](https://github.com/ProDInfo/DbContextOnModelCreatingSplitter/releases). 
+Notas de implementación y mantenimiento
+- Si se usan `--entity-suffix` y los nombres ya incluyen el sufijo, no se renombra.
+- `--embed-configs` posibilita mantener la clase de configuración dentro del fichero de entity en lugar de generar un fichero separado.
+- Si `--no-replace` está activo, el código dentro de OnModelCreating se deja intacto y únicamente se generan los archivos de configuración.
 
-### License
-[MIT](https://github.com/lauxjpn/DbContextOnConfiguringSplitter/blob/master/LICENSE)
+Descarga
+Puedes descargar binarios desde las releases: https://github.com/ProDInfo/DbContextOnModelCreatingSplitter/releases
+
+Licencia
+MIT
